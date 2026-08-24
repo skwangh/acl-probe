@@ -10,6 +10,7 @@
 #   3  ACK 판정 실패 — 지속 시간 내 임계 미달
 #   64 인자 오류
 #   70 실행 환경 오류 (도구 없음 — ACK 모드인데 nc 가 없는 경우 포함)
+#   130/143 신호로 중단됨(Ctrl+C·잡 취소) — 판정이 아니다
 #
 # 알려진 한계 — 인지하고 감수한 오탐 (설계 3절):
 #   서버 아웃바운드 UDP 만 막힌 경우 인바운드 ACL 이 정상이어도 3 으로
@@ -41,7 +42,7 @@ set -euo pipefail
 # 목록이 갈라지면 프로버가 리스너가 보지 않는 포트로 쏘게 되어,
 # ACL 이 열려 있는데도 FAIL 이 나오는 조용한 오진이 생긴다.
 
-BAND_LO=40000
+BAND_LO=49152
 BAND_HI=65535
 MAGIC=ACLP1       # 프로브 페이로드 매직 (송신 → 수신)
 ACK_MAGIC=ACLA1   # ACK 페이로드 매직 (수신 → 송신). 프로브와 반드시 달라야 한다.
@@ -59,12 +60,12 @@ EPHEMERAL_SAFE_PORTS=(61000 62000 63000 64000 65000 65500 65534 65535)
 
 # 임시 포트 범위와 겹치는 포트들. 대역 전체 커버리지를 위해 넣는다.
 # 다른 프로세스가 임시 포트로 쓰고 있으면 바인드에 실패할 수 있고, 그것은 정상이다.
-EPHEMERAL_RISK_PORTS=(40000 40001 43000 46000 49000 52000 55000 58000)
+EPHEMERAL_RISK_PORTS=(49152 49153 51000 53000 55000 57000 59000 60999)
 
 # 대역 밖 감시 포트. 여기에 패킷이 도착하면 ACL 과다 개방 경고를 낸다.
 # 판정에는 포함하지 않는다.
 # 65535 가 UDP 최대 포트이므로 위쪽 감시 포트는 존재할 수 없다 (설계 3절).
-OUT_OF_BAND_PORTS=(39999)
+OUT_OF_BAND_PORTS=(49151)
 
 ports_in_band() {
   printf '%s\n' "${EPHEMERAL_SAFE_PORTS[@]}" "${EPHEMERAL_RISK_PORTS[@]}"
@@ -163,6 +164,7 @@ usage() {
   3   ACK 판정 실패 — 지속 시간 내 임계 미달
   64  인자 오류
   70  실행 환경 오류 (ACK 모드인데 nc 가 없는 경우 포함)
+  130/143  신호로 중단됨 (Ctrl+C·잡 취소) — 판정이 아님
 
 ACK 판정에 대하여:
   리스너는 패킷을 받으면 ACK 를 회신한다. ACK 는 조기 종료 장치이자 판정
@@ -359,8 +361,13 @@ main() {
 
   if (( ack_mode == 1 )); then
     ackfile=$(mktemp "${TMPDIR:-/tmp}/acl-probe-ack.XXXXXX")
+    # 정리는 EXIT 에만 건다. 신호 트랩이 exit 하면 EXIT 트랩이 발동해
+    # 정리가 한 번 돌고 종료코드(130/143)가 보존된다. exit 없이 끝나면
+    # 본체가 계속 돌다가 마감에서 3(판정 실패)으로 위장한다 — 리스너와 같은 결함.
     # shellcheck disable=SC2064
-    trap "rm -f '$ackfile'" EXIT INT TERM
+    trap "rm -f '$ackfile'" EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     log_info "송신 시작 — 대상 ${target}, 버스트 ${bursts}회 × 간격 ${interval}초, 포트당 ${packets}발, ACK ${min_acks}건이면 조기 종료"
   else
     log_info "송신 시작 — 대상 ${target}, 버스트 ${bursts}회 × 간격 ${interval}초, 포트당 ${packets}발, ACK 대기 없음"
