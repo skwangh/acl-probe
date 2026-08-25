@@ -2,20 +2,32 @@ name: ACL 점검 — 송출
 
 # 외부에서 신규 서버로 UDP 프로브를 쏘고 ACK 로 판정한다.
 #
-# 지속 시간 내 서로 다른 포트의 ACK 가 임계(min_acks)에 못 미치면 프로버가
-# 3 으로 죽어 이 잡이 실패한다. 서버 아웃바운드만 막힌 경우에도 실패하는
-# 오탐은 인지하고 감수한 결정이다 (설계 2026-08-20-probe-ack-verdict).
+# 대상은 여럿을 받는다 (public_target 에 콤마로 구분). 한 번에 하나씩 순차로
+# 보고 사이에 target_delay 초를 쉰다. duration 은 대상당 지속이다.
+#
+# 대상당 지속 시간 내 서로 다른 포트의 ACK 가 임계(min_acks)에 못 미치면
+# 프로버가 3 으로 죽어 이 잡이 실패한다 — 대상 하나만 미달해도 그렇다.
+# 서버 아웃바운드만 막힌 경우에도 실패하는 오탐은 인지하고 감수한 결정이다
+# (설계 2026-08-20-probe-ack-verdict).
 # no_ack 를 켠 실행의 성공은 송신 완료만 뜻하며 판정이 아니다.
 
 on:
   workflow_dispatch:
     inputs:
+      # workflow_dispatch 의 입력 타입에는 textarea 가 없다. string 은 UI 에서
+      # 한 줄 입력이므로 여러 개는 콤마로 이어 붙인다. gh CLI·API 로 넘길 때는
+      # 개행을 써도 되며, 프로버가 콤마·세미콜론·공백·개행을 모두 구분자로 본다.
       public_target:
-        description: '외부 접점 IP 또는 공인 DNS 이름 (수신 측과 같은 장비여야 합니다)'
+        description: '외부 접점 IP 또는 공인 DNS 이름. 여럿이면 콤마로 구분 (예: 203.0.113.9,203.0.113.10). 최대 50개'
         required: true
         type: string
+      target_delay:
+        description: '한 대상을 끝내고 다음 대상으로 넘어가기 전 대기(초). 0 이면 쉬지 않음'
+        required: false
+        default: '10'
+        type: string
       duration:
-        description: '총 송신 지속(초)'
+        description: '대상 하나당 송신 지속(초)'
         required: false
         default: '300'
         type: string
@@ -52,6 +64,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TARGET: ${{ inputs.public_target }}
+      TARGET_DELAY: ${{ inputs.target_delay }}
       DURATION: ${{ inputs.duration }}
       INTERVAL: ${{ inputs.interval }}
       MIN_ACKS: ${{ inputs.min_acks }}
@@ -65,8 +78,10 @@ jobs:
       - name: 프로브 송신
         run: |
           set -o pipefail
+          # TARGET 은 대상 하나일 수도, 콤마로 이어 붙인 목록일 수도 있다.
+          # 쪼개는 일은 프로버가 한다 — 여기서 나누면 구분자 규칙이 두 곳에 생긴다.
           args=(--target "$TARGET" --duration "$DURATION" --interval "$INTERVAL"
-                --min-acks "$MIN_ACKS")
+                --min-acks "$MIN_ACKS" --target-delay "$TARGET_DELAY")
           if [ "$FORCE_INPUT" = "true" ]; then
             args+=(--force)
           fi
@@ -81,86 +96,166 @@ jobs:
           # 체크아웃·zip 다운로드·파일 복사 등 파일이 어떤 경로로 왔든 동작해야 한다.
           bash acl-probe "${args[@]}" 2>&1 | tee probe.log
 
-      # 프로버가 마지막에 내보내는 ACL_PROBE_RESULT 한 줄만 읽는다.
+      # 프로버가 내보내는 ACL_PROBE_RESULT 줄만 읽는다. 대상마다 한 줄이다.
       # 한글 문장을 파싱하지 않으므로 문구가 바뀌어도 깨지지 않는다.
       - name: ACK 결과 기록
         id: result
         if: always()
         run: |
-          line="$(grep -m1 '^ACL_PROBE_RESULT ' probe.log 2>/dev/null || true)"
+          # 대상마다 결과 줄이 하나씩 나온다. grep -m1 로 첫 줄만 읽으면
+          # 배치의 두 번째 대상부터가 조용히 사라진다.
+          mapfile -t lines < <(grep '^ACL_PROBE_RESULT ' probe.log 2>/dev/null || true)
+          total=${#lines[@]}
 
-          if [ -z "$line" ]; then
+          # "key=value" 토큰에서 값 하나를 꺼낸다. 두 번째 인자가 대상 줄이다.
+          field() {
+            printf '%s\n' "$2" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -n1
+          }
+
+          if [ "$total" -eq 0 ]; then
             echo "::warning title=송출 결과::ACL_PROBE_RESULT 줄을 찾지 못했습니다. 프로버가 중간에 죽었을 수 있습니다."
             {
+              echo "targets=0"
+              echo "passed=0"
+              echo "failed=0"
               echo "acks=unknown"
               echo "ack_mode=unknown"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # "key=value" 토큰에서 값 하나를 꺼낸다.
-          field() {
-            printf '%s\n' "$line" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -n1
-          }
+          # 요청한 대상 수를 프로버와 같은 구분자로 센다. 결과 줄 수와 다르면
+          # 배치가 중간에 멈춘 것이다 — 그것은 ACL 이 막힌 것과 다른 사실이라
+          # 뭉개지 않고 따로 알린다.
+          requested=$(printf '%s' "${TARGET:-}" \
+            | tr -s ',;[:space:]' '\n' | sed '/^$/d' | sort -u | wc -l)
 
-          sent=$(field sent)
-          bursts_done=$(field bursts_done)
-          bursts_total=$(field bursts_total)
-          ack_mode=$(field ack_mode)
-          acks=$(field acks)
-          min_acks=$(field min_acks)
-          early=$(field early)
-          src=$(field src)
-          preflight=$(field preflight)
+          tmp="${RUNNER_TEMP:-.}"
+          : > "$tmp/overview.md"
+          : > "$tmp/detail.md"
+          passed=0
+          failed=0
+
+          for line in "${lines[@]}"; do
+            target=$(field target "$line")
+            sent=$(field sent "$line")
+            bursts_done=$(field bursts_done "$line")
+            bursts_total=$(field bursts_total "$line")
+            ack_mode=$(field ack_mode "$line")
+            acks=$(field acks "$line")
+            min_acks=$(field min_acks "$line")
+            early=$(field early "$line")
+
+            if [ "$ack_mode" != "1" ]; then
+              verdict=none
+            elif [ "${acks:-0}" -lt "${min_acks:-0}" ]; then
+              verdict=fail
+            else
+              verdict=pass
+            fi
+
+            case "$verdict" in
+              pass) mark='✅ 통과';    passed=$(( passed + 1 )) ;;
+              fail) mark='❌ 실패';    failed=$(( failed + 1 )) ;;
+              none) mark='— 판정 없음' ;;
+            esac
+
+            # job 로그에 대상마다 한 줄로 남기고 실행 주석으로도 띄운다.
+            # ACK 는 판정 기준이다 — 임계 미달이면 프로버가 3 으로 죽어 잡이
+            # 붉어지고, 이 스텝은 if: always() 로 돌아 해석을 주석에 남긴다.
+            if [ "$verdict" = "pass" ]; then
+              if [ "$early" = "1" ]; then
+                echo "::notice title=ACK 수신::[${target}] 서로 다른 ${acks}개 포트에서 ACK 회신 (임계 ${min_acks}) — 조기 종료, ${sent}발 송신"
+              else
+                echo "::notice title=ACK 수신::[${target}] 서로 다른 ${acks}개 포트에서 ACK 회신 (임계 ${min_acks}) — ${sent}발 송신"
+              fi
+            elif [ "$verdict" = "fail" ]; then
+              echo "::error title=ACK 판정 실패::[${target}] 서로 다른 ${acks}개 포트에서만 ACK 회신 (임계 ${min_acks} 미달) — 수신 측 acl-listen 이 PASS 라면 서버 아웃바운드 UDP 차단 신호입니다"
+            else
+              echo "::notice title=ACK 수신::[${target}] ACK 대기 없음(--no-ack, 판정 없음) — ${sent}발 송신"
+            fi
+
+            printf '| `%s` | %s | %s | %s | %s | %s |\n' \
+              "$target" "$mark" "$acks" "$min_acks" \
+              "$( [ "$early" = "1" ] && echo '예' || echo '아니오' )" "$sent" \
+              >> "$tmp/overview.md"
+
+            {
+              echo "### 대상 \`${target}\`"
+              echo
+              if [ "$ack_mode" = "1" ]; then
+                echo "ACK: 서로 다른 **${acks}개** 포트에서 회신 (임계 ${min_acks})"
+              else
+                echo 'ACK 대기 없음 (`--no-ack`)'
+              fi
+              echo
+              echo '| 항목 | 값 |'
+              echo '|---|---|'
+              echo "| 송신 발수 | ${sent} |"
+              echo "| 버스트 | ${bursts_done} / ${bursts_total} |"
+              echo "| ACK 회신 포트 수 | ${acks} |"
+              echo "| ACK 임계값 | ${min_acks} |"
+              echo "| 조기 종료 | $( [ "$early" = "1" ] && echo '예' || echo '아니오' ) |"
+              echo
+            } >> "$tmp/detail.md"
+          done
+
+          if [ "${requested:-0}" -gt 0 ] && [ "$requested" -ne "$total" ]; then
+            echo "::warning title=배치 중단::요청 대상 ${requested}개 중 ${total}개만 결과가 있습니다 — 잡 취소·시간 상한으로 프로버가 중간에 멈췄을 수 있습니다. 결과 없는 대상은 판정된 것이 아닙니다."
+          fi
 
           # 뒤따르는 스텝·잡이 쓸 수 있게 출력값으로 남긴다.
           {
-            echo "sent=$sent"
-            echo "acks=$acks"
-            echo "min_acks=$min_acks"
-            echo "ack_mode=$ack_mode"
-            echo "early=$early"
+            echo "targets=$total"
+            echo "passed=$passed"
+            echo "failed=$failed"
           } >> "$GITHUB_OUTPUT"
 
-          # job 로그에 한 줄로 남기고 실행 주석으로도 띄운다.
-          # ACK 는 판정 기준이다 — 임계 미달이면 프로버가 3 으로 죽어 잡이 붉어지고,
-          # 이 스텝은 if: always() 로 돌아 실패 해석을 주석에 남긴다.
-          if [ "$ack_mode" = "1" ]; then
-            if [ "$early" = "1" ]; then
-              echo "::notice title=ACK 수신::서로 다른 ${acks}개 포트에서 ACK 회신 (임계 ${min_acks}) — 조기 종료, ${sent}발 송신"
-            else
-              echo "::error title=ACK 판정 실패::서로 다른 ${acks}개 포트에서만 ACK 회신 (임계 ${min_acks} 미달) — 수신 측 acl-listen 이 PASS 라면 서버 아웃바운드 UDP 차단 신호입니다"
-            fi
-          else
-            echo "::notice title=ACK 수신::ACK 대기 없음(--no-ack, 판정 없음) — ${sent}발 송신"
+          # 대상이 하나면 예전과 같은 이름으로 대상별 값도 남긴다.
+          # 여럿이면 내지 않는다 — 첫 대상 값을 대표로 내면 뒤쪽 대상의 실패가
+          # 가려진다. 배치에서는 passed/failed 를 봐야 한다.
+          if [ "$total" -eq 1 ]; then
+            {
+              echo "sent=$(field sent "${lines[0]}")"
+              echo "acks=$(field acks "${lines[0]}")"
+              echo "min_acks=$(field min_acks "${lines[0]}")"
+              echo "ack_mode=$(field ack_mode "${lines[0]}")"
+              echo "early=$(field early "${lines[0]}")"
+            } >> "$GITHUB_OUTPUT"
           fi
+
+          # 소스 IP·사전 점검은 실행 하나에 하나다. 대상마다 반복하지 않는다.
+          src=$(field src "${lines[0]}")
+          preflight=$(field preflight "${lines[0]}")
 
           {
             echo '## ACL 점검 — 송출 결과'
             echo
-            if [ "$ack_mode" = "1" ]; then
-              echo "### ACK: 서로 다른 **${acks}개** 포트에서 회신 (임계 ${min_acks})"
-            else
-              echo '### ACK 대기 없음 (`--no-ack`)'
+            if [ "$total" -gt 1 ]; then
+              echo "### 대상 ${total}개 — 통과 ${passed} / 실패 ${failed}"
+              echo
+              echo '| 대상 | 판정 | ACK | 임계 | 조기 종료 | 송신 |'
+              echo '|---|---|---|---|---|---|'
+              cat "$tmp/overview.md"
+              echo
             fi
+            cat "$tmp/detail.md"
+            echo '### 실행 정보'
             echo
             echo '| 항목 | 값 |'
             echo '|---|---|'
-            echo "| 송신 발수 | ${sent} |"
-            echo "| 버스트 | ${bursts_done} / ${bursts_total} |"
-            echo "| ACK 회신 포트 수 | ${acks} |"
-            echo "| ACK 임계값 | ${min_acks} |"
-            echo "| 조기 종료 | $( [ "$early" = "1" ] && echo '예' || echo '아니오' ) |"
             echo "| 송출 소스 IP | ${src} |"
             echo "| 사전 점검 | ${preflight} |"
             echo
-            echo '> **ACK 는 판정 기준입니다.** 임계 미달이면 프로버가 종료코드 3 으로 실패합니다.'
+            echo '> **ACK 는 판정 기준입니다.** 한 대상이라도 임계에 미달하면 프로버가 종료코드 3 으로 실패합니다.'
             echo '> 이 실패는 인바운드 차단·리스너 미기동·서버 아웃바운드 차단을 구분하지 못합니다.'
             echo '> 수신 측(`acl-listen`)이 PASS 인데 이 잡이 실패했다면 아웃바운드 차단 신호입니다.'
             echo '>'
             echo '> `--no-ack` 실행의 성공은 송신 완료만 뜻하며 판정이 아닙니다.'
             echo '>'
             echo '> 사전 점검이 성공했어도 UDP 53 만 증명하며 고포트 egress 의 보증은 아닙니다.'
+            echo '>'
+            echo '> 결과 줄이 없는 대상은 **판정되지 않은** 것입니다 — 통과가 아닙니다.'
             echo
             echo '<details><summary>전체 로그</summary>'
             echo
