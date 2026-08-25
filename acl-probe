@@ -16,6 +16,11 @@
 #   서버 아웃바운드 UDP 만 막힌 경우 인바운드 ACL 이 정상이어도 3 으로
 #   실패한다. 프로버 실행 중 리스너가 떠 있어야 통과할 수 있다.
 #
+# 대상은 여럿을 받는다. --target 에 콤마(또는 개행)로 이어 붙이거나 --target 을
+# 여러 번 준다. 한 번에 한 대상씩 순차로 보고, 사이에 --target-delay 초를 쉰다.
+# --duration 은 대상당 지속이다. 대상마다 ACL_PROBE_RESULT 줄이 하나씩 나오고,
+# 한 대상이 실패해도 나머지를 계속 보되 하나라도 임계 미달이면 전체가 3 이다.
+#
 # 반드시 GitHub-hosted 러너처럼 사내망 밖에서 실행해야 한다.
 # 사내망에서 쏘면 외부 ACL 을 전혀 검증하지 못한다.
 #
@@ -85,6 +90,12 @@ ports_is_in_band() {
 }
 # ─────────────────────── 미러 블록 끝 ───────────────────────
 
+# ─────────────────────── 송신 측 전용 상수 ───────────────────────
+# 배치 관련 상수는 미러 블록에 두지 않는다. 수신 측에는 "대상" 개념이 아예
+# 없어 acl-listen 에 넣을 자리가 없고, 미러 블록은 한 줄도 달라서는 안 된다.
+DEFAULT_TARGET_DELAY=10   # 대상 사이 대기(초)
+MAX_TARGETS=50            # 배치 상한 — 잘못 붙여넣은 목록이 몇 시간을 끌지 않게 한다
+
 # ─────────────────────── 종료코드 ───────────────────────
 # 0/3 은 ACK 판정이다. 2/64/70 은 판정이 아니다 — 절대 뭉개지 않는다.
 EX_OK=0          # ACK 임계 충족 (--no-ack 면 송신 완료)
@@ -143,13 +154,19 @@ is_private_ip() {
 # ─────────────────────── 송신 ───────────────────────
 usage() {
   cat <<'EOF'
-사용법: acl-probe --target HOST [옵션]
+사용법: acl-probe --target HOST[,HOST...] [옵션]
 
 대상의 UDP 포트들에 프로브를 반복 버스트로 송신하고 ACK 로 판정한다.
+대상이 여럿이면 한 번에 하나씩 순차로 본다.
 
 옵션:
-  --target HOST     외부 접점 IP 또는 공인 DNS 이름 (필수)
-  --duration N      총 송신 지속(초) — 마감이다. 1~3600, 기본 300
+  --target LIST     외부 접점 IP 또는 공인 DNS 이름 (필수)
+                    콤마·세미콜론·공백·개행으로 여럿을 이어 붙일 수 있고,
+                    --target 을 여러 번 줘도 된다. 중복은 걷어낸다.
+                    최대 50개.
+  --target-delay N  한 대상을 끝내고 다음 대상으로 넘어가기 전 대기(초).
+                    0~3600, 기본 10. 0 이면 쉬지 않는다.
+  --duration N      대상 하나당 송신 지속(초) — 마감이다. 1~3600, 기본 300
   --interval N      버스트 간격(초). 1~3600, 기본 5
   --packets N       포트당 발수. 1~10, 기본 1
   --min-acks N      판정 임계값. 이만큼 서로 다른 포트에서 ACK 를 받으면
@@ -174,6 +191,15 @@ ACK 판정에 대하여:
   알려진 한계(감수한 오탐): 서버에서 나가는 UDP 가 막혀 있으면 인바운드가
   정상이어도 ACK 는 오지 않아 실패한다. 수신 측 acl-listen 이 PASS 인데
   이 실패가 났다면 그것이 서버 아웃바운드 차단 신호다.
+
+배치에 대하여:
+  대상마다 ACL_PROBE_RESULT 줄이 하나씩 나온다. 한 대상이 실패해도 나머지를
+  계속 보고, 하나라도 ACK 임계에 미달하면 전체가 3 으로 끝난다.
+
+  --duration 은 대상당 지속이므로 총 소요는
+  대상 수 × --duration + --target-delay × (대상 수 - 1) 까지 늘어난다.
+  GitHub Actions 잡 상한(6시간)을 넘기면 뒤쪽 대상은 판정도 받지 못하고
+  잡이 잘린다. 추정 소요가 상한을 넘으면 경고를 낸다.
 
 주의: --no-ack 실행의 0 은 송신 완료만 뜻하며 ACL 판정이 아니다.
 EOF
@@ -246,109 +272,62 @@ probe_public_ip() {
   curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null
 }
 
-main() {
-  local target="" duration=$DEFAULT_DURATION interval=$DEFAULT_INTERVAL
-  local packets=$DEFAULT_PACKETS force=0
-  local min_acks=$DEFAULT_MIN_PORTS ack_mode=1
+# 구분자로 이어진 대상 목록을 한 줄에 하나씩 펼친다. 중복은 첫 등장 순서를
+# 지키며 걷어내고, 몇 개를 걷어냈는지 알린다 — 조용히 줄면 "3개 넣었는데
+# 결과가 2개" 를 설명할 수 없다.
+#
+# 외부 명령을 쓰지 않는다. --no-ack 경로는 date 하나만 있는 PATH 에서도
+# 돌아야 하기 때문이다 (test/probe.bats 의 PATH 검사).
+targets_parse() {
+  local -a toks=() out=()
+  local i j n dup=0 tok found
+  # 콤마·세미콜론·공백·탭·개행·CR 을 모두 구분자로 본다.
+  # read -d '' 는 입력 끝에서 0 이 아닌 값을 주지만 배열은 채워진다.
+  IFS=$',;\n\t\r ' read -r -d '' -a toks <<<"$*" || true
 
-  while (( $# > 0 )); do
-    case $1 in
-      --target)
-        [[ $# -ge 2 ]] || die "$EX_USAGE" "--target 에 값이 필요합니다"
-        target=$2
-        shift 2
-        ;;
-      --duration)
-        [[ $# -ge 2 ]] || die "$EX_USAGE" "--duration 에 값이 필요합니다"
-        duration=$2
-        shift 2
-        ;;
-      --interval)
-        [[ $# -ge 2 ]] || die "$EX_USAGE" "--interval 에 값이 필요합니다"
-        interval=$2
-        shift 2
-        ;;
-      --packets)
-        [[ $# -ge 2 ]] || die "$EX_USAGE" "--packets 에 값이 필요합니다"
-        packets=$2
-        shift 2
-        ;;
-      --min-acks)
-        [[ $# -ge 2 ]] || die "$EX_USAGE" "--min-acks 에 값이 필요합니다"
-        min_acks=$2
-        shift 2
-        ;;
-      --no-ack)
-        ack_mode=0
-        shift
-        ;;
-      --force)
-        force=1
-        shift
-        ;;
-      --help|-h)
-        usage
-        exit "$EX_OK"
-        ;;
-      *)
-        usage >&2
-        die "$EX_USAGE" "알 수 없는 옵션: $1"
-        ;;
-    esac
+  n=${#toks[@]}
+  for (( i = 0; i < n; i++ )); do
+    tok=${toks[i]}
+    [[ -n $tok ]] || continue
+    found=0
+    for (( j = 0; j < ${#out[@]}; j++ )); do
+      if [[ ${out[j]} == "$tok" ]]; then
+        found=1
+        break
+      fi
+    done
+    if (( found == 1 )); then
+      dup=$(( dup + 1 ))
+      continue
+    fi
+    out+=("$tok")
   done
 
-  [[ -n $target ]] || { usage >&2; die "$EX_USAGE" "--target 은 필수입니다"; }
-  in_range "$duration" 1 3600 || die "$EX_USAGE" "--duration 은 1~3600 사이 정수여야 합니다 (받은 값: ${duration})"
-  in_range "$interval" 1 3600 || die "$EX_USAGE" "--interval 은 1~3600 사이 정수여야 합니다 (받은 값: ${interval})"
-  in_range "$packets"  1 10   || die "$EX_USAGE" "--packets 은 1~10 사이 정수여야 합니다 (받은 값: ${packets})"
-  in_range "$min_acks" 1 17 \
-    || die "$EX_USAGE" "--min-acks 은 1~17 사이 정수여야 합니다 (상수 포트가 17개, 받은 값: ${min_acks})"
-  (( interval <= duration )) || die "$EX_USAGE" "--interval(${interval})이 --duration(${duration})보다 큽니다"
+  (( dup == 0 )) || log_warn "중복 대상 ${dup}개를 걷어냈습니다"
+  (( ${#out[@]} > 0 )) || return 0
+  printf '%s\n' "${out[@]}"
+}
 
-  # ACK 는 판정 기준이다 (설계 2026-08-20-probe-ack-verdict). nc 가 없으면
-  # ACK 를 받을 수 없는데, 그것을 쏘고-잊기로 강등하면 환경에 따라 게이트가
-  # 조용히 항상-통과로 변한다. 판정 없이 쏘려면 --no-ack 를 명시해야 한다.
-  if (( ack_mode == 1 )) && ! command -v nc >/dev/null 2>&1; then
-    die "$EX_ENV" "nc 가 없어 ACK 판정을 할 수 없습니다 — 판정 없이 쏘려면 --no-ack 를 명시하십시오"
-  fi
+# 대상 하나를 본다. 버스트 루프를 돌리고 사람용 요약과 ACL_PROBE_RESULT 줄을 낸다.
+#
+# 인자: target duration interval packets ack_mode min_acks src ts preflight ackfile
+#       (ack_mode 가 0 이면 ackfile 은 쓰이지 않으므로 빈 문자열이어도 된다)
+# 반환: 0 판정 통과(--no-ack 면 송신 완료) / EX_NOACK ACK 임계 미달
+#
+# 여기서 exit 하지 않는다 — 배치에서 한 대상이 실패해도 나머지를 봐야 한다.
+# 최종 종료코드는 main 이 정한다.
+#
+# 주의: main 이 `|| rc=$?` 로 부르므로 이 함수 안에서는 set -e 가 작동하지
+# 않는다. 송신 경로는 이미 스스로 실패를 삼킨다 (probe_send·probe_send_ack 는
+# 항상 0 을 준다) — 그 성질에 기대는 것이고, 여기에 죽어야 하는 명령을 넣으면
+# 조용히 넘어간다.
+probe_target() {
+  local target=$1 duration=$2 interval=$3 packets=$4 ack_mode=$5
+  local min_acks=$6 src=$7 ts=$8 preflight=$9 ackfile=${10}
 
-  # 사전 점검 — 러너가 UDP 를 아예 못 쏘는 경우를 구분한다.
-  # 한계: UDP 53 만 증명하며 고포트 egress 의 보증은 아니다.
-  local preflight
-  preflight=$(probe_preflight_udp)
-  case $preflight in
-    ok)
-      log_info "사전 점검: UDP 왕복 성공 (dig @8.8.8.8) — 단 UDP 53 만 증명하며 고포트 보증은 아닙니다"
-      ;;
-    failed)
-      log_warn "사전 점검: UDP 왕복 실패 — 러너가 UDP 를 내보내지 못할 수 있습니다"
-      ;;
-    skipped)
-      log_warn "사전 점검 생략: dig 가 없습니다 — UDP 가 막혔다는 뜻이 아니며, 송신은 그대로 진행합니다"
-      ;;
-  esac
-
-  local src
-  src=$(probe_public_ip) || src=""
-  if [[ -z $src ]]; then
-    src=unknown
-    log_warn "공인 IP 를 확보하지 못했습니다 — 송출 위치 검증이 불가능해집니다"
-  else
-    log_info "송출 소스 IP: ${src}"
-    if is_private_ip "$src"; then
-      log_warn "소스가 사내 대역입니다 — 사내망에서 쏘면 외부 ACL 을 검증하지 못합니다"
-    fi
-  fi
-
-  # 점검을 못 한 경우(skipped)는 막지 않는다. 실패로 확인된 경우만 막는다.
-  if [[ $preflight == failed ]] && (( force == 0 )); then
-    die "$EX_PREFLIGHT" "사전 점검 실패로 중단합니다 (--force 로 강행 가능)"
-  fi
-
-  local bursts sent=0 seq=0 ts port i b=0 acks=0 early=0 ackfile=""
+  local bursts sent=0 seq=0 port i b=0 acks=0 early=0
   local start deadline burst_start now remain bdone=0 expired=0
   bursts=$(probe_burst_count "$duration" "$interval")
-  ts=$(date +%s)
 
   # duration 은 마감이지 버스트 횟수가 아니다.
   #
@@ -356,18 +335,16 @@ main() {
   # 쓴다고 가정했다. ACK 모드에서는 버스트마다 nc 대기가 얹히므로 그 가정이
   # 깨진다 — 리스너가 침묵하면 60 × (대기 + 5초) 가 되어 5분짜리 실행이
   # 6~8분을 끌었다. 리스너가 응답할 때는 조기 종료가 그 초과를 가려 준다.
+  #
+  # 배치에서는 이 마감이 대상당으로 적용된다. 마감이 무너지면 대상 하나가
+  # 늦어질 때마다 뒤쪽 대상이 밀려 잡 상한에 잘린다.
   start=$(date +%s)
   deadline=$(( start + duration ))
 
   if (( ack_mode == 1 )); then
-    ackfile=$(mktemp "${TMPDIR:-/tmp}/acl-probe-ack.XXXXXX")
-    # 정리는 EXIT 에만 건다. 신호 트랩이 exit 하면 EXIT 트랩이 발동해
-    # 정리가 한 번 돌고 종료코드(130/143)가 보존된다. exit 없이 끝나면
-    # 본체가 계속 돌다가 마감에서 3(판정 실패)으로 위장한다 — 리스너와 같은 결함.
-    # shellcheck disable=SC2064
-    trap "rm -f '$ackfile'" EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
+    # 대상마다 ACK 판정은 독립이다. 앞 대상의 ACK 가 섞이면 첫 대상만
+    # 열려 있어도 나머지가 전부 통과한다.
+    : > "$ackfile"
     log_info "송신 시작 — 대상 ${target}, 버스트 ${bursts}회 × 간격 ${interval}초, 포트당 ${packets}발, ACK ${min_acks}건이면 조기 종료"
   else
     log_info "송신 시작 — 대상 ${target}, 버스트 ${bursts}회 × 간격 ${interval}초, 포트당 ${packets}발, ACK 대기 없음"
@@ -434,8 +411,9 @@ main() {
     printf '주의: --no-ack 실행의 결과는 송신 완료만 뜻하며 ACL 판정이 아닙니다.\n'
   fi
 
-  # 기계 판독용 한 줄. 워크플로가 이 줄만 grep 해 요약·주석·출력값을 만든다.
-  # 판정 실패(3)로 끝나는 경우에도 반드시 나온다 — if: always() 스텝이 읽는다.
+  # 기계 판독용 한 줄. 워크플로가 이 줄들만 읽어 요약·주석·출력값을 만든다.
+  # 대상마다 하나씩 나온다 — 배치가 중간에 잘려도 거기까지의 결과는 남는다.
+  # 판정 실패로 끝나는 대상도 반드시 낸다 — if: always() 스텝이 읽는다.
   # 접두사와 키 이름은 계약이다. 고치면 워크플로도 함께 고쳐야 한다.
   printf 'ACL_PROBE_RESULT sent=%s bursts_done=%s bursts_total=%s ack_mode=%s acks=%s min_acks=%s early=%s src=%s target=%s preflight=%s\n' \
     "$sent" "$bdone" "$bursts" "$ack_mode" "$acks" "$min_acks" "$early" "$src" "$target" "$preflight"
@@ -445,6 +423,192 @@ main() {
   if (( ack_mode == 1 )) && (( acks < min_acks )); then
     printf '실패: ACK 임계 미달 — 인바운드 차단·리스너 미기동·서버 아웃바운드 차단을 구분하지 못합니다.\n'
     printf '      수신 측 acl-listen 이 PASS 라면 서버 아웃바운드 UDP 차단 신호입니다.\n'
+    return "$EX_NOACK"
+  fi
+
+  return "$EX_OK"
+}
+
+main() {
+  local target_raw="" duration=$DEFAULT_DURATION interval=$DEFAULT_INTERVAL
+  local packets=$DEFAULT_PACKETS force=0
+  local min_acks=$DEFAULT_MIN_PORTS ack_mode=1
+  local target_delay=$DEFAULT_TARGET_DELAY
+
+  while (( $# > 0 )); do
+    case $1 in
+      --target)
+        [[ $# -ge 2 ]] || die "$EX_USAGE" "--target 에 값이 필요합니다"
+        # 여러 번 줄 수 있다. 콤마로 이어 붙여 한 목록으로 만든다.
+        target_raw+="${target_raw:+,}$2"
+        shift 2
+        ;;
+      --duration)
+        [[ $# -ge 2 ]] || die "$EX_USAGE" "--duration 에 값이 필요합니다"
+        duration=$2
+        shift 2
+        ;;
+      --interval)
+        [[ $# -ge 2 ]] || die "$EX_USAGE" "--interval 에 값이 필요합니다"
+        interval=$2
+        shift 2
+        ;;
+      --packets)
+        [[ $# -ge 2 ]] || die "$EX_USAGE" "--packets 에 값이 필요합니다"
+        packets=$2
+        shift 2
+        ;;
+      --min-acks)
+        [[ $# -ge 2 ]] || die "$EX_USAGE" "--min-acks 에 값이 필요합니다"
+        min_acks=$2
+        shift 2
+        ;;
+      --target-delay)
+        [[ $# -ge 2 ]] || die "$EX_USAGE" "--target-delay 에 값이 필요합니다"
+        target_delay=$2
+        shift 2
+        ;;
+      --no-ack)
+        ack_mode=0
+        shift
+        ;;
+      --force)
+        force=1
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit "$EX_OK"
+        ;;
+      *)
+        usage >&2
+        die "$EX_USAGE" "알 수 없는 옵션: $1"
+        ;;
+    esac
+  done
+
+  # 대상 목록을 펼친다. --target 을 여러 번 줘도, 한 번에 콤마·개행으로
+  # 이어 붙여도 같은 결과가 된다 — GitHub Actions 의 string 입력은 UI 에서
+  # 한 줄이라 콤마를 쓰게 되고, gh CLI·API 로 넘기면 개행이 들어온다.
+  local -a targets=()
+  local t
+  while read -r t; do
+    targets+=("$t")
+  done < <(targets_parse "$target_raw")
+
+  (( ${#targets[@]} > 0 )) || { usage >&2; die "$EX_USAGE" "--target 은 필수입니다"; }
+  (( ${#targets[@]} <= MAX_TARGETS )) \
+    || die "$EX_USAGE" "--target 은 최대 ${MAX_TARGETS}개까지입니다 (받은 값: ${#targets[@]}개)"
+  in_range "$duration" 1 3600 || die "$EX_USAGE" "--duration 은 1~3600 사이 정수여야 합니다 (받은 값: ${duration})"
+  in_range "$interval" 1 3600 || die "$EX_USAGE" "--interval 은 1~3600 사이 정수여야 합니다 (받은 값: ${interval})"
+  in_range "$packets"  1 10   || die "$EX_USAGE" "--packets 은 1~10 사이 정수여야 합니다 (받은 값: ${packets})"
+  in_range "$min_acks" 1 17 \
+    || die "$EX_USAGE" "--min-acks 은 1~17 사이 정수여야 합니다 (상수 포트가 17개, 받은 값: ${min_acks})"
+  (( interval <= duration )) || die "$EX_USAGE" "--interval(${interval})이 --duration(${duration})보다 큽니다"
+  in_range "$target_delay" 0 3600 \
+    || die "$EX_USAGE" "--target-delay 은 0~3600 사이 정수여야 합니다 (받은 값: ${target_delay})"
+
+  # ACK 는 판정 기준이다 (설계 2026-08-20-probe-ack-verdict). nc 가 없으면
+  # ACK 를 받을 수 없는데, 그것을 쏘고-잊기로 강등하면 환경에 따라 게이트가
+  # 조용히 항상-통과로 변한다. 판정 없이 쏘려면 --no-ack 를 명시해야 한다.
+  if (( ack_mode == 1 )) && ! command -v nc >/dev/null 2>&1; then
+    die "$EX_ENV" "nc 가 없어 ACK 판정을 할 수 없습니다 — 판정 없이 쏘려면 --no-ack 를 명시하십시오"
+  fi
+
+  # 사전 점검 — 러너가 UDP 를 아예 못 쏘는 경우를 구분한다.
+  # 한계: UDP 53 만 증명하며 고포트 egress 의 보증은 아니다.
+  local preflight
+  preflight=$(probe_preflight_udp)
+  case $preflight in
+    ok)
+      log_info "사전 점검: UDP 왕복 성공 (dig @8.8.8.8) — 단 UDP 53 만 증명하며 고포트 보증은 아닙니다"
+      ;;
+    failed)
+      log_warn "사전 점검: UDP 왕복 실패 — 러너가 UDP 를 내보내지 못할 수 있습니다"
+      ;;
+    skipped)
+      log_warn "사전 점검 생략: dig 가 없습니다 — UDP 가 막혔다는 뜻이 아니며, 송신은 그대로 진행합니다"
+      ;;
+  esac
+
+  local src
+  src=$(probe_public_ip) || src=""
+  if [[ -z $src ]]; then
+    src=unknown
+    log_warn "공인 IP 를 확보하지 못했습니다 — 송출 위치 검증이 불가능해집니다"
+  else
+    log_info "송출 소스 IP: ${src}"
+    if is_private_ip "$src"; then
+      log_warn "소스가 사내 대역입니다 — 사내망에서 쏘면 외부 ACL 을 검증하지 못합니다"
+    fi
+  fi
+
+  # 점검을 못 한 경우(skipped)는 막지 않는다. 실패로 확인된 경우만 막는다.
+  if [[ $preflight == failed ]] && (( force == 0 )); then
+    die "$EX_PREFLIGHT" "사전 점검 실패로 중단합니다 (--force 로 강행 가능)"
+  fi
+
+  local ts ackfile=""
+  local total=${#targets[@]} idx rc passed=0 failed=0 worst
+  ts=$(date +%s)
+
+  if (( ack_mode == 1 )); then
+    # ACK 파일은 실행 하나에 하나다. 대상마다 새로 만들지 않고 비워서 다시 쓴다
+    # — 트랩을 한 번만 걸면 되고, 배치가 길어도 임시 파일이 쌓이지 않는다.
+    ackfile=$(mktemp "${TMPDIR:-/tmp}/acl-probe-ack.XXXXXX")
+    # 정리는 EXIT 에만 건다. 신호 트랩이 exit 하면 EXIT 트랩이 발동해
+    # 정리가 한 번 돌고 종료코드(130/143)가 보존된다. exit 없이 끝나면
+    # 본체가 계속 돌다가 마감에서 3(판정 실패)으로 위장한다 — 리스너와 같은 결함.
+    # shellcheck disable=SC2064
+    trap "rm -f '$ackfile'" EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+  fi
+
+  if (( total > 1 )); then
+    log_info "배치: 대상 ${total}개를 순차로 봅니다 (대상당 최대 ${duration}초, 대상 사이 ${target_delay}초 대기)"
+    # 최악 소요를 미리 알린다. 잡 상한(6시간)에 걸려 잘리면 뒤쪽 대상은
+    # 판정도 받지 못하는데, 그것은 ACL 이 막힌 것과 다른 사실이다.
+    worst=$(( total * duration + (total - 1) * target_delay ))
+    log_info "최악 소요 추정: ${worst}초 (조기 종료하면 줄어듭니다)"
+    if (( worst > 21600 )); then
+      log_warn "추정 소요가 GitHub Actions 잡 상한(21600초)을 넘습니다 — 대상을 나누거나 --duration 을 줄이십시오"
+    fi
+  fi
+
+  for (( idx = 1; idx <= total; idx++ )); do
+    if (( total > 1 )); then
+      log_info "── 대상 ${idx}/${total}: ${targets[idx-1]} ──"
+    fi
+
+    rc=0
+    probe_target "${targets[idx-1]}" "$duration" "$interval" "$packets" \
+                 "$ack_mode" "$min_acks" "$src" "$ts" "$preflight" "$ackfile" || rc=$?
+    if (( rc == 0 )); then
+      passed=$(( passed + 1 ))
+    else
+      # 여기서 끊지 않는다. 남은 대상도 봐야 어느 대상이 막혔는지 알 수 있다.
+      failed=$(( failed + 1 ))
+    fi
+
+    # 마지막 대상 뒤에는 쉬지 않는다.
+    if (( idx < total )) && (( target_delay > 0 )); then
+      log_info "다음 대상까지 ${target_delay}초 대기합니다"
+      sleep "$target_delay"
+    fi
+  done
+
+  if (( total > 1 )); then
+    if (( ack_mode == 1 )); then
+      printf '배치 완료: 대상 %s개 — 통과 %s개, 실패 %s개\n' "$total" "$passed" "$failed"
+    else
+      printf '배치 완료: 대상 %s개 송신 (--no-ack, 판정 없음)\n' "$total"
+    fi
+  fi
+
+  # 한 대상이라도 임계에 미달하면 전체가 실패다. 통과한 대상 수를 세는 것으로는
+  # "전부 열렸다" 를 뜻하는 게이트가 되지 않는다.
+  if (( ack_mode == 1 )) && (( failed > 0 )); then
     exit "$EX_NOACK"
   fi
 
